@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>موقعیت مکانی من</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: Tahoma, sans-serif; height: 100vh; overflow: hidden; }
+  #map { position: absolute; inset: 0; z-index: 1; }
+
+  .panel {
+    position: absolute; top: 20px; right: 20px; z-index: 1000;
+    background: rgba(255,255,255,0.97); padding: 20px;
+    border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+    width: 320px; max-height: calc(100vh - 40px); overflow-y: auto;
+  }
+  .panel h1 { font-size: 18px; margin-bottom: 15px; color: #1a1a2e; }
+
+  .status { padding: 10px; border-radius: 8px; background: #f0f0f5;
+    font-size: 13px; margin-bottom: 12px; text-align: center; line-height: 1.6; }
+  .status.success { background: #d4edda; color: #155724; }
+  .status.error   { background: #f8d7da; color: #721c24; }
+  .status.waiting { background: #fff3cd; color: #856404; }
+
+  .info { background: #f8f9fa; padding: 12px; border-radius: 8px; margin-bottom: 12px; }
+  .info.hidden { display: none; }
+  .info-row { display: flex; justify-content: space-between; padding: 6px 0;
+    font-size: 13px; border-bottom: 1px solid #e9ecef; }
+  .info-row:last-child { border-bottom: none; }
+  .label { color: #6c757d; }
+  .value { font-weight: 600; color: #1a1a2e; direction: ltr; }
+
+  .room-section { border-top: 1px solid #e9ecef; padding-top: 12px; }
+  .room-section.hidden { display: none; }
+  .room-section label { display: block; font-size: 12px; color: #6c757d; margin-bottom: 8px; }
+  .room-row { display: flex; gap: 8px; margin-bottom: 8px; }
+  .room-row input { flex: 1; padding: 8px; border: 1px solid #ced4da;
+    border-radius: 6px; font-family: inherit; font-size: 13px; }
+  .room-row button { padding: 8px 16px; background: #0066cc; color: white;
+    border: none; border-radius: 6px; cursor: pointer; font-family: inherit; font-size: 13px; }
+  .room-row button:hover { background: #0052a3; }
+
+  @media (max-width: 600px) {
+    .panel { top: auto; bottom: 0; right: 0; left: 0; width: 100%;
+      border-radius: 12px 12px 0 0; max-height: 50vh; }
+  }
+</style>
+</head>
+<body>
+
+<div id="map"></div>
+
+<div class="panel">
+  <h1>📍 موقعیت مکانی شما</h1>
+
+  <div id="permission-status" class="status waiting">
+    ⏳ در حال درخواست اجازه دسترسی به موقعیت مکانی...
+  </div>
+
+  <div id="location-info" class="info hidden">
+    <div class="info-row"><span class="label">عرض جغرافیایی</span><span id="lat" class="value">-</span></div>
+    <div class="info-row"><span class="label">طول جغرافیایی</span><span id="lng" class="value">-</span></div>
+    <div class="info-row"><span class="label">دقت</span><span id="accuracy" class="value">-</span></div>
+    <div class="info-row"><span class="label">آخرین به‌روزرسانی</span><span id="timestamp" class="value">-</span></div>
+  </div>
+
+  <div class="room-section hidden" id="room-section">
+    <label for="room-input">کد اتاق (برای اشتراک با کاربر دیگر):</label>
+    <div class="room-row">
+      <input type="text" id="room-input" placeholder="مثلاً: room123" />
+      <button id="join-btn">اتصال</button>
+    </div>
+    <div id="room-status" class="status"></div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+<script>
+  const $ = id => document.getElementById(id);
+
+  // ---------- نقشه ----------
+  const map = L.map('map').setView([35.6892, 51.389], 12);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '© OpenStreetMap', maxZoom: 19
+  }).addTo(map);
+
+  const myIcon = L.divIcon({
+    html: '<div style="background:#0066cc;width:18px;height:18px;border-radius:50%;border:3px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,.4)"></div>',
+    iconSize: [24,24], iconAnchor: [12,12]
+  });
+  const peerIcon = L.divIcon({
+    html: '<div style="background:#e63946;width:18px;height:18px;border-radius:50%;border:3px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,.4)"></div>',
+    iconSize: [24,24], iconAnchor: [12,12]
+  });
+
+  const permStatus = $('permission-status');
+  const locInfo    = $('location-info');
+  const roomStatus = $('room-status');
+
+  let myMarker = null, accuracyCircle = null, myPosition = null;
+  const peerMarkers = {};
+  let currentRoom = null;
+
+  // ---------- اتصال Socket (اختیاری) ----------
+  let socket = null;
+  try {
+    if (typeof io === 'function') {
+      socket = io();
+
+      socket.on('connect', () => {
+        $('room-section').classList.remove('hidden');
+      });
+
+      socket.on('connect_error', () => {
+        // سرور نیست — فقط نمایش موقعیت محلی
+        console.log('بدون سرور — حالت محلی.');
+      });
+
+      socket.on('room-members', (others) => {
+        roomStatus.textContent = `✅ به اتاق متصل شدید. (${others.length} کاربر دیگر)`;
+        roomStatus.className = 'status success';
+        if (myPosition) socket.emit('send-location', myPosition);
+      });
+
+      socket.on('peer-location', ({ id, lat, lng }) => {
+        const latlng = [lat, lng];
+        if (peerMarkers[id]) {
+          peerMarkers[id].setLatLng(latlng);
+        } else {
+          peerMarkers[id] = L.marker(latlng, { icon: peerIcon })
+            .addTo(map).bindPopup('👤 کاربر دیگر');
+        }
+      });
+
+      socket.on('peer-left', ({ id }) => {
+        if (peerMarkers[id]) { map.removeLayer(peerMarkers[id]); delete peerMarkers[id]; }
+      });
+    }
+  } catch (e) {
+    console.warn('Socket.IO در دسترس نیست — فقط حالت محلی.');
+  }
+
+  $('join-btn').addEventListener('click', () => {
+    if (!socket) {
+      roomStatus.textContent = 'سرور در دسترس نیست.';
+      roomStatus.className = 'status error';
+      return;
+    }
+    const id = $('room-input').value.trim();
+    if (!id) {
+      roomStatus.textContent = 'کد اتاق را وارد کنید.';
+      roomStatus.className = 'status error';
+      return;
+    }
+    if (currentRoom) clearPeers();
+    currentRoom = id;
+    socket.emit('join-room', id);
+    roomStatus.textContent = `⏳ در حال اتصال به اتاق "${id}"...`;
+    roomStatus.className = 'status waiting';
+  });
+
+  function clearPeers() {
+    Object.values(peerMarkers).forEach(m => map.removeLayer(m));
+    Object.keys(peerMarkers).forEach(k => delete peerMarkers[k]);
+  }
+
+  // ---------- Geolocation ----------
+  function requestLocation() {
+    if (!navigator.geolocation) {
+      permStatus.textContent = '❌ مرورگر شما از موقعیت مکانی پشتیبانی نمی‌کند.';
+      permStatus.className = 'status error';
+      return;
+    }
+    permStatus.textContent = '⏳ لطفاً اجازه دسترسی به موقعیت مکانی را تأیید کنید...';
+    permStatus.className = 'status waiting';
+
+    navigator.geolocation.watchPosition(onSuccess, onError, {
+      enableHighAccuracy: true, timeout: 15000, maximumAge: 0
+    });
+  }
+
+  function onSuccess(pos) {
+    const { latitude, longitude, accuracy } = pos.coords;
+    myPosition = { lat: latitude, lng: longitude, accuracy };
+
+    permStatus.textContent = '✅ دسترسی تأیید شد — موقعیت شما در حال نمایش است.';
+    permStatus.className = 'status success';
+    locInfo.classList.remove('hidden');
+
+    $('lat').textContent = latitude.toFixed(6);
+    $('lng').textContent = longitude.toFixed(6);
+    $('accuracy').textContent = `± ${Math.round(accuracy)} متر`;
+    $('timestamp').textContent = new Date(pos.timestamp).toLocaleTimeString('fa-IR');
+
+    const latlng = [latitude, longitude];
+    if (myMarker) {
+      myMarker.setLatLng(latlng);
+      accuracyCircle.setLatLng(latlng).setRadius(accuracy);
+    } else {
+      myMarker = L.marker(latlng, { icon: myIcon }).addTo(map).bindPopup('📍 شما اینجایید');
+      accuracyCircle = L.circle(latlng, {
+        radius: accuracy, color: '#0066cc', fillColor: '#0066cc',
+        fillOpacity: 0.1, weight: 1
+      }).addTo(map);
+      map.setView(latlng, 17);
+    }
+
+    if (socket && currentRoom) socket.emit('send-location', myPosition);
+  }
+
+  function onError(err) {
+    const msgs = {
+      [err.PERMISSION_DENIED]: '❌ شما اجازه دسترسی را رد کردید. از آیکن قفل کنار آدرس، اجازه بدهید و صفحه را بازخوانی کنید.',
+      [err.POSITION_UNAVAILABLE]: '⚠️ موقعیت مکانی در دسترس نیست. GPS و شبکه را بررسی کنید.',
+      [err.TIMEOUT]: '⏱️ زمان درخواست تمام شد. دوباره تلاش کنید.'
+    };
+    permStatus.textContent = msgs[err.code] || 'خطای نامشخص در دریافت موقعیت.';
+    permStatus.className = 'status error';
+  }
+
+  requestLocation();
+</script>
+</body>
+</html>
